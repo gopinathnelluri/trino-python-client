@@ -58,6 +58,7 @@ from typing import cast
 from typing import Dict
 from typing import List
 from typing import Literal
+import queue
 from typing import Optional
 from typing import Tuple
 from typing import TypedDict
@@ -155,6 +156,8 @@ class ClientSession:
                  support role management. See connector documentation for more details.
     :param timezone: The timezone for query processing. Defaults to the system's local timezone.
     :param encoding: The encoding for the spooling protocol. Defaults to None.
+    :param prefetch_threads: Number of background threads to use for spooled data prefetching. Default is 1.
+    :param prefetch_buffer_size: Max number of segments to buffer in memory during prefetching. Default is 5.
     """
 
     def __init__(
@@ -172,6 +175,8 @@ class ClientSession:
         roles: Optional[Union[Dict[str, str], str]] = None,
         timezone: Optional[str] = None,
         encoding: Optional[Union[str, List[str]]] = None,
+        prefetch_threads: int = 1,
+        prefetch_buffer_size: int = 5,
     ):
         self._object_lock = threading.Lock()
         self._prepared_statements: Dict[str, str] = {}
@@ -194,6 +199,8 @@ class ClientSession:
             from tzlocal import get_localzone_name
             self._timezone = get_localzone_name()
         self._encoding = encoding
+        self._prefetch_threads = prefetch_threads
+        self._prefetch_buffer_size = prefetch_buffer_size
 
     @property
     def user(self) -> str:
@@ -293,6 +300,26 @@ class ClientSession:
     def encoding(self) -> Union[str, List[str]]:
         with self._object_lock:
             return self._encoding
+
+    @property
+    def prefetch_threads(self) -> int:
+        with self._object_lock:
+            return self._prefetch_threads
+
+    @prefetch_threads.setter
+    def prefetch_threads(self, prefetch_threads: int) -> None:
+        with self._object_lock:
+            self._prefetch_threads = prefetch_threads
+
+    @property
+    def prefetch_buffer_size(self) -> int:
+        with self._object_lock:
+            return self._prefetch_buffer_size
+
+    @prefetch_buffer_size.setter
+    def prefetch_buffer_size(self, prefetch_buffer_size: int) -> None:
+        with self._object_lock:
+            self._prefetch_buffer_size = prefetch_buffer_size
 
     @staticmethod
     def _format_roles(roles: Union[Dict[str, str], str]) -> Dict[str, str]:
@@ -972,6 +999,18 @@ class TrinoQuery:
             spooled = self._to_segments(rows)
             if self._fetch_mode == "segments":
                 return spooled
+            
+            # Check for prefetch configuration
+            session = getattr(self._request, "client_session", None)
+            prefetch_threads = 1
+            buffer_size = 5
+            if session:
+                prefetch_threads = getattr(session, "prefetch_threads", 1)
+                buffer_size = getattr(session, "prefetch_buffer_size", 5)
+
+            if prefetch_threads > 0:
+                 return ThreadedSegmentIterator(spooled, self._row_mapper, max_workers=prefetch_threads, buffer_size=buffer_size)
+
             # Return iterator directly, do NOT materialize with list()
             return SegmentIterator(spooled, self._row_mapper)
         elif isinstance(status.rows, list):
@@ -1280,6 +1319,109 @@ class SegmentIterator:
             self._rows = iter(self._decoder.decode(self._current_segment.segment))
         except StopIteration:
             self._finished = True
+
+
+class ThreadedSegmentIterator(SegmentIterator):
+    def __init__(self, segments: Union[DecodableSegment, List[DecodableSegment]], mapper: RowMapper, max_workers: int = 1, buffer_size: int = 5) -> None:
+        super().__init__(segments, mapper)
+        self._segments_queue = queue.Queue(maxsize=buffer_size)
+        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="trino-spool-fetcher")
+        self._shutdown = False
+        self._exception = None
+        
+        # Start background producer
+        self._future = self._executor.submit(self._prefetch_segments)
+
+    def _prefetch_segments(self):
+        try:
+            # Recreate iterator from the segments passed to init to iterate them in this thread
+            # Note: super().__init__ created self._segments iterator, but we want to consume it here.
+            # However, iterators are not thread-safe if shared.
+            # We will consume self._segments, assuming __next__ (consumer) doesn't use it directly
+            # except via _load_next_segment which we override.
+            
+            # Actually, we should override _load_next_segment to pull from queue.
+            # The producer uses the original segments iterator.
+            
+            for segment in self._segments:
+                if self._shutdown:
+                    break
+                # Fetch data eagerly here (this triggers network I/O)
+                # Ensure the segment loads its data (DecodableSegment.segment property usually fetches if logical?)
+                # Actually, DecodableSegment holds _segment which is raw data or SpooledSegment.
+                # If SpooledSegment, accessing .segment might not trigger download?
+                # Wait, SpooledSegment doesn't have a .segment property that fetches.
+                # SpooledSegment IS the segment.
+                # The Decoder calls .decode(segment.segment) -> segment is usage of 'segment' property of DecodableSegment wrapper?
+                # Let's check DecodableSegment again.
+                
+                # DecodableSegment definition (not shown above, assuming from previous context):
+                # It has `encoding` and `segment` properties.
+                
+                # For Spooled:
+                # segment.segment is the SpooledSegment object (from _SpooledSegmentTO).
+                # Wait, SpooledSegment *class* (lines 1150ish) has methods? 
+                # The data is fetched in `SegmentDecoder.decode`.
+                # If we want to prefetch, we must download the data here.
+                # But SegmentDecoder is what fetches? 
+                # Let's check SpooledSegment implementation again if possible or assume we need to trigger it.
+                
+                # If we just put the DecodableSegment in the queue, we accomplish nothing unless we trigger the network call.
+                # The `DecodableSegment.segment` is just the DTO.
+                # The downloading happens in `SegmentDecoder.decode`.
+                
+                # Ideally, we decode in the background thread too?
+                # Yes, decoding matches "prefetching + parsing".
+                
+                # So producer logic:
+                # 1. Get next DecodableSegment
+                # 2. Decode it (which downloads it)
+                # 3. Put the list of rows (or the decoded bytes) into queue.
+                
+                # Issue: We need the decoder.
+                # We can create a local decoder in this thread.
+                
+                decoder = SegmentDecoder(CompressedQueryDataDecoderFactory(self._mapper)
+                                               .create(segment.encoding))
+                # This downloads AND decodes.
+                decoded_rows = decoder.decode(segment.segment)
+                
+                # We put the *decoded rows* into the queue.
+                self._segments_queue.put((segment, decoded_rows))
+                
+            self._segments_queue.put(None) # Sentinel
+            
+        except Exception as e:
+            self._exception = e
+            self._segments_queue.put(None) # Sentinel to unblock consumer
+
+    def _load_next_segment(self):
+        if self._current_segment:
+             # Acknowledge the *previous* segment
+             segment = self._current_segment.segment
+             if isinstance(segment, SpooledSegment):
+                 segment.acknowledge()
+
+        # Check for background exception
+        if self._exception:
+             raise self._exception
+
+        # Get next item from queue
+        item = self._segments_queue.get()
+        if item is None:
+             if self._exception:
+                 raise self._exception
+             self._finished = True
+             return
+
+        # Item is (DecodableSegment, List[rows])
+        self._current_segment, rows = item
+        self._rows = iter(rows)
+
+    def close(self):
+        self._shutdown = True
+        self._executor.shutdown(wait=False)
+
 
 
 class SegmentDecoder():

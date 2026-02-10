@@ -164,6 +164,8 @@ class Connection:
         roles=None,
         timezone=None,
         encoding: Union[str, List[str]] = _USE_DEFAULT_ENCODING,
+        prefetch_threads: int = 1,
+        prefetch_buffer_size: int = 5,
     ):
         # Automatically assign http_schema, port based on hostname
         parsed_host = urlparse(host, allow_fragments=False)
@@ -194,6 +196,8 @@ class Connection:
             roles=roles,
             timezone=timezone,
             encoding=encoding,
+            prefetch_threads=prefetch_threads,
+            prefetch_buffer_size=prefetch_buffer_size,
         )
         # mypy cannot follow module import
         if http_session is None:
