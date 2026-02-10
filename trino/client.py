@@ -905,8 +905,39 @@ class TrinoQuery:
         self._result = TrinoResult(self, rows)
 
         # Execute should block until at least one row is received or query is finished or cancelled
-        while not self.finished and not self.cancelled and len(self._result.rows) == 0:
-            self._result.rows += self.fetch()
+        # If rows is a list (standard execution), we can check len.
+        # If rows is an iterator (spooled), we can't check len easily without peeking.
+        # However, for standard execution, the first response usually contains no rows (just stats),
+        # so we need to fetch.
+        
+        # If it's a list and empty, or if we haven't finished and haven't cancelled, try to fetch more.
+        # The issue with spooled execution is that fetch() returns an iterator.
+        
+        # For standard execution: rows starts as list. fetch() returns list.
+        # For spooled execution: rows starts as list (empty). fetch() returns Iterator.
+        
+        # We need to detect if we have data. 
+        # For spooled, we might get an iterator that *yields* nothing if segments are empty?
+        # But we want to block until we have *something* to return or finished.
+        
+        # Modified logic:
+        # If _result.rows is empty list, we fetch.
+        # If _result.rows key becomes an iterator, we stop blocking and let the user consume it.
+        
+        while not self.finished and not self.cancelled:
+            if isinstance(self._result.rows, list) and len(self._result.rows) == 0:
+                 new_rows = self.fetch()
+                 if isinstance(new_rows, list):
+                     self._result.rows += new_rows
+                 else:
+                     # It's an iterator (spooled segments), replace rows with it
+                     self._result.rows = new_rows
+                     # We have an iterator now, so we can return result to user
+                     break
+            else:
+                 # We have data (list with items or an iterator), so return
+                 break
+                 
         return self._result
 
     def _update_state(self, status):
@@ -920,7 +951,7 @@ class TrinoQuery:
         if status.columns:
             self._columns = status.columns
 
-    def fetch(self) -> List[Union[List[Any]], Any]:
+    def fetch(self) -> Union[List[Union[List[Any], Any]], Iterator[List[Any]]]:
         """Continue fetching data for the current query_id"""
         try:
             response = self._request.get(self._request.next_uri)
@@ -941,7 +972,8 @@ class TrinoQuery:
             spooled = self._to_segments(rows)
             if self._fetch_mode == "segments":
                 return spooled
-            return list(SegmentIterator(spooled, self._row_mapper))
+            # Return iterator directly, do NOT materialize with list()
+            return SegmentIterator(spooled, self._row_mapper)
         elif isinstance(status.rows, list):
             return self._row_mapper.map(rows)
         else:
