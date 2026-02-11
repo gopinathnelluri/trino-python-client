@@ -1324,6 +1324,8 @@ class SegmentIterator:
 class ThreadedSegmentIterator(SegmentIterator):
     def __init__(self, segments: Union[DecodableSegment, List[DecodableSegment]], mapper: RowMapper, max_workers: int = 1, buffer_size: int = 5) -> None:
         super().__init__(segments, mapper)
+        self._max_workers = max_workers
+        self._buffer_size = buffer_size
         self._segments_queue = queue.Queue(maxsize=buffer_size)
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="trino-spool-fetcher")
         self._shutdown = False
@@ -1334,75 +1336,60 @@ class ThreadedSegmentIterator(SegmentIterator):
 
     def _prefetch_segments(self):
         try:
-            # Recreate iterator from the segments passed to init to iterate them in this thread
-            # Note: super().__init__ created self._segments iterator, but we want to consume it here.
-            # However, iterators are not thread-safe if shared.
-            # We will consume self._segments, assuming __next__ (consumer) doesn't use it directly
-            # except via _load_next_segment which we override.
+            # We want to maintain order, so we need to submit tasks and keep track of them
+            # But the consumer expects items in order.
+            # Design:
+            # 1. We iterate through self._segments (the source iterator)
+            # 2. For each segment, we submit a task to the executor to download & decode it.
+            # 3. We put the FUTURE into the queue (or we wait for result order?)
             
-            # Actually, we should override _load_next_segment to pull from queue.
-            # The producer uses the original segments iterator.
+            # Better Design for Order + Parallelism:
+            # The producer loop submits tasks up to buffer_size.
+            # Wait, ThreadPoolExecutor has unbounded queue. We need to throttle submission.
+            # We can use a semaphore or bounded queue for futures.
             
+            # Let's use the queue to store FUTURES.
+            # The consumer gets the future and calls .result().
+            # This allows N futures to be "in flight" (downloading).
+            # The consumer blocks on the *next* future, but subsequent ones are downloading in background.
+            
+            # Producer Logic:
             for segment in self._segments:
                 if self._shutdown:
                     break
-                # Fetch data eagerly here (this triggers network I/O)
-                # Ensure the segment loads its data (DecodableSegment.segment property usually fetches if logical?)
-                # Actually, DecodableSegment holds _segment which is raw data or SpooledSegment.
-                # If SpooledSegment, accessing .segment might not trigger download?
-                # Wait, SpooledSegment doesn't have a .segment property that fetches.
-                # SpooledSegment IS the segment.
-                # The Decoder calls .decode(segment.segment) -> segment is usage of 'segment' property of DecodableSegment wrapper?
-                # Let's check DecodableSegment again.
                 
-                # DecodableSegment definition (not shown above, assuming from previous context):
-                # It has `encoding` and `segment` properties.
+                # Create a future for this segment's data
+                future = self._executor.submit(self._fetch_and_decode, segment)
                 
-                # For Spooled:
-                # segment.segment is the SpooledSegment object (from _SpooledSegmentTO).
-                # Wait, SpooledSegment *class* (lines 1150ish) has methods? 
-                # The data is fetched in `SegmentDecoder.decode`.
-                # If we want to prefetch, we must download the data here.
-                # But SegmentDecoder is what fetches? 
-                # Let's check SpooledSegment implementation again if possible or assume we need to trigger it.
-                
-                # If we just put the DecodableSegment in the queue, we accomplish nothing unless we trigger the network call.
-                # The `DecodableSegment.segment` is just the DTO.
-                # The downloading happens in `SegmentDecoder.decode`.
-                
-                # Ideally, we decode in the background thread too?
-                # Yes, decoding matches "prefetching + parsing".
-                
-                # So producer logic:
-                # 1. Get next DecodableSegment
-                # 2. Decode it (which downloads it)
-                # 3. Put the list of rows (or the decoded bytes) into queue.
-                
-                # Issue: We need the decoder.
-                # We can create a local decoder in this thread.
-                
-                decoder = SegmentDecoder(CompressedQueryDataDecoderFactory(self._mapper)
-                                               .create(segment.encoding))
-                # This downloads AND decodes.
-                decoded_rows = decoder.decode(segment.segment)
-                
-                # We put the *decoded rows* into the queue.
-                self._segments_queue.put((segment, decoded_rows))
+                # Put the future in the queue. This blocks if queue is full.
+                # This explicitly throttles the production rate to buffer_size + max_workers
+                self._segments_queue.put((segment, future))
                 
             self._segments_queue.put(None) # Sentinel
             
         except Exception as e:
             self._exception = e
-            self._segments_queue.put(None) # Sentinel to unblock consumer
+            self._segments_queue.put(None)
+
+    def _fetch_and_decode(self, segment: DecodableSegment) -> List[List[Any]]:
+        # This runs in a worker thread
+        # Create a local decoder (decoders might not be thread safe)
+        decoder = SegmentDecoder(CompressedQueryDataDecoderFactory(self._mapper)
+                                       .create(segment.encoding))
+        # This triggers download AND decode
+        # segment.segment access for SpooledSegment just returns the wrapper object
+        # decoder.decode accesses .data property which triggers download
+        return decoder.decode(segment.segment)
 
     def _load_next_segment(self):
         if self._current_segment:
              # Acknowledge the *previous* segment
+             # Note: acknowledge uses the GLOBAL executor in client.py, which is fine
              segment = self._current_segment.segment
              if isinstance(segment, SpooledSegment):
                  segment.acknowledge()
 
-        # Check for background exception
+        # Check for background exception in producer thread
         if self._exception:
              raise self._exception
 
@@ -1414,9 +1401,18 @@ class ThreadedSegmentIterator(SegmentIterator):
              self._finished = True
              return
 
-        # Item is (DecodableSegment, List[rows])
-        self._current_segment, rows = item
-        self._rows = iter(rows)
+        # Item is (DecodableSegment, Future)
+        self._current_segment, future = item
+        
+        # Wait for the result (download/decode completion)
+        # This blocks if the download is still in progress (latency masking)
+        # If download finished while we were processing previous rows, it returns immediately.
+        try:
+            rows = future.result()
+            self._rows = iter(rows)
+        except Exception as e:
+            # Check if it was cancelled
+            raise e
 
     def close(self):
         self._shutdown = True
