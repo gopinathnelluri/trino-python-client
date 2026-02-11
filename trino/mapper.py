@@ -44,9 +44,18 @@ class BooleanValueMapper(ValueMapper[bool]):
             return None
         if isinstance(value, bool):
             return value
-        if str(value).lower() == 'true':
+        # Optimization: Avoid str() and lower() for common cases if input is already string
+        if isinstance(value, str):
+            lower_val = value.lower()
+            if lower_val == 'true':
+                return True
+            if lower_val == 'false':
+                return False
+        # Fallback for other types
+        s_val = str(value).lower()
+        if s_val == 'true':
             return True
-        if str(value).lower() == 'false':
+        if s_val == 'false':
             return False
         raise ValueError(f"Server sent unexpected value {value} of type {type(value)} for boolean")
 
@@ -78,6 +87,8 @@ class DecimalValueMapper(ValueMapper[Decimal]):
     def map(self, value: Any) -> Optional[Decimal]:
         if value is None:
             return None
+        if isinstance(value, Decimal):
+            return value
         return Decimal(value)
 
 
@@ -359,11 +370,28 @@ class RowMapper:
         self.columns = columns
 
     def map(self, rows: List[List[Any]]) -> List[List[Any]]:
-        if len(self.columns) == 0:
-            return rows
-        return [self._map_row(row) for row in rows]
+        if not rows:
+            return []
+        
+        # Pre-bind the map methods for each column to avoid attribute lookup in loop
+        mappers = [col.map for col in self.columns]
+        
+        result = []
+        for row in rows:
+            mapped_row = []
+            # zip is faster than enumerate + indexing
+            for mapper, value in zip(mappers, row):
+                try:
+                    mapped_row.append(mapper(value))
+                except ValueError as e:
+                     error_str = f"Could not convert '{value}' into the associated python type"
+                     raise trino.exceptions.TrinoDataError(error_str) from e
+            result.append(mapped_row)
+            
+        return result
 
     def _map_row(self, row: List[Any]) -> List[Any]:
+        # Legacy / Helper if someone calls it directly, but map() bypasses it
         return [self._map_value(value, self.columns[index]) for index, value in enumerate(row)]
 
     def _map_value(self, value: Any, value_mapper: ValueMapper[T]) -> Optional[T]:
